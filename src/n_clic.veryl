@@ -1,0 +1,539 @@
+import veryl_csr::CsrPkg::*;
+import ArbitrationPackage::*;
+module NClic #(
+    param BaseAddr: CsrAddr = 'h20 as CsrAddr,
+) (
+    // Clock
+    i_clk : input clock,
+    ni_rst: input reset,
+
+    i_csr_ena : input  logic      ,
+    i_csr_addr: input  CsrAddr    ,
+    i_rs1_data: input  logic  <32>,
+    i_rs1     : input  Reg        ,
+    i_rd      : input  Reg        ,
+    i_csr_op  : input  logic  <3> ,
+    o_csr_data: output logic  <32>,
+
+    i_interrupts: input logic<8>, // for now 8 vectors, we can make this parametric
+    i_ret       : input logic   ,
+
+    o_interrupt    : output logic    ,
+    o_nclic_address: output logic<32>,
+    o_depth        : output logic<2> , // for now prio 0-3, we can make this parametric
+
+    i_pc: input logic<32>,
+) {
+
+    var dispatches: logic<8>     ;
+    var pendings  : logic<8>     ;
+    var prios     : logic<2>  [8];
+    var enableds  : logic<8>     ;
+    var o_datas   : logic<32> [8];
+    for i in 0..7 :gen_wrapper {
+        inst csr: CfgCsrWrapper #(
+            Addr: (i as CsrAddr) + BaseAddr,
+        ) (
+            i_clk                 ,
+            ni_rst                ,
+            i_csr_ena             ,
+            i_csr_addr            ,
+            i_rs1_data            ,
+            i_rs1                 ,
+            i_rd                  ,
+            i_csr_op              ,
+            o_csr_data: o_datas[i],
+
+            i_interrupt: i_interrupts[i],
+            i_dispatch : dispatches[i]  ,
+
+            o_pending: pendings[i],
+            o_prio   : prios[i]   ,
+            o_enabled: enableds[i],
+        );
+    }
+    var isr_addresses  : logic<32> [8];
+    var address_w_enas : logic     [8];
+    var address_w_datas: logic<32> [8];
+    var address_r_enas : logic     [8];
+    var address_r_datas: logic<32> [8];
+    for i in 0..7 :gen_isr_addr {
+        inst csr: veryl_csr::Csr #(
+            Addr       : (i as CsrAddr) + BaseAddr + 'h20 as CsrAddr,
+            FieldOffset: 0                                          ,
+            FieldWidth : 32                                         ,
+        ) (
+            i_csr_ena                       ,
+            i_csr_addr                      ,
+            i_rs1_data                      ,
+            i_rs1                           ,
+            i_rd                            ,
+            i_csr_op                        ,
+            i_reg_data  : isr_addresses[i]  ,
+            o_reg_w_ena : address_w_enas[i] ,
+            o_reg_w_data: address_w_datas[i],
+            o_reg_r_ena : address_r_enas[i] ,
+            o_reg_r_data: address_r_datas[i],
+        );
+        always_ff {
+            if_reset {
+                isr_addresses[i] = 0;
+            } else {
+                if address_w_enas[i] == 1 {
+                    isr_addresses[i] = address_w_datas[i];
+                }
+            }
+        }
+    }
+
+    var arbitration_vals: logic<2> [8];
+    for i in 0..7 :gen_arbitration_vals {
+        assign arbitration_vals[i] = if (pendings[i] && enableds[i]) ? prios[i] : 0 as 2;
+    }
+
+    var arbitered_index: logic<3>;
+    var arbitered_prio : logic<2>;
+    inst arbitration: ArbitrationTree::<ArbitrationPackage::ArbitrationPolarity::MAX> (
+        values_i: arbitration_vals,
+        index_o : arbitered_index ,
+        prio_o  : arbitered_prio  ,
+    );
+
+    var prio_threshold   : logic<2>     ;
+    var threshold_stack  : logic<2>  [3];
+    var ret_address_stack: logic<32> [3];
+    always_ff {
+        if_reset {
+            prio_threshold    = 0;
+            o_depth           = 0;
+            threshold_stack   = '{0 as 2, 0 as 2, 0 as 2};
+            ret_address_stack = '{0 as 32, 0 as 32, 0 as 32};
+        } else {
+            if o_interrupt && !i_ret {
+                threshold_stack[o_depth]   =  prio_threshold;
+                ret_address_stack[o_depth] =  i_pc;
+                prio_threshold             =  arbitered_prio;
+                o_depth                    += 1;
+            } else if o_interrupt && i_ret {
+                prio_threshold = arbitered_prio;
+            } else if !o_interrupt && i_ret {
+                if o_depth == 0 {
+                    // TODO RAISE EXCEPTION
+                } else {
+                    o_depth        -= 1;
+                    prio_threshold =  threshold_stack[o_depth - 1];
+                }
+            }
+        }
+    }
+
+    assign o_interrupt = if i_ret ? threshold_stack[o_depth - 1] <: arbitered_prio : prio_threshold <: arbitered_prio;
+    // TODO
+    assign o_nclic_address = if i_ret ?
+        (if o_interrupt ? isr_addresses[arbitered_index] : ret_address_stack[o_depth - 1])
+    :
+        isr_addresses[arbitered_index] as 32
+    ;
+    for i in 0..7 :gen_dispatches {
+        assign dispatches[i] = if i == arbitered_index && o_interrupt ? 1 : 0;
+    }
+
+}
+
+#[test(nclic)]
+embed (inline) sv{{{
+    module test;
+        import veryl_csr_CsrPkg::*;
+        logic i_clk;
+        logic ni_rst;
+
+        logic i_csr_ena;
+        CsrAddr i_csr_addr;
+        logic[31:0] i_rs1_data;
+        Reg i_rs1;
+        Reg i_rd;
+        logic[2:0] i_csr_op;
+        logic[31:0] o_csr_data;
+
+        logic[7:0] i_interrupts;
+        logic i_ret;
+        
+        logic o_interrupt;
+        logic[31:0] o_nclic_address;
+        logic[1:0] o_depth;
+
+        logic[31:0] i_pc;
+
+
+        veryl_nclic_NClic dut (
+            .i_clk,
+            .ni_rst,
+            .i_csr_ena,
+            .i_csr_addr,
+            .i_rs1_data,
+            .i_rs1,
+            .i_rd,
+            .i_csr_op,
+            .o_csr_data,
+
+            .i_interrupts,
+            .i_ret,
+
+            .o_interrupt,
+            .o_nclic_address,
+            .o_depth,
+
+            .i_pc
+        );
+        initial begin
+            ni_rst = 0;
+            i_clk = 0;
+
+            i_ret = 0;
+            i_interrupts = 0;
+
+            i_csr_ena = 0;
+            i_csr_addr = 0;
+            i_rs1_data = 0;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_op = 0;
+            i_pc = 0;
+
+            #15 ni_rst = 1;
+            #10; 
+        end
+
+        always #10 i_clk = ~i_clk;
+
+        initial begin
+            #20;
+            // start by writing some ISR addresses
+            i_csr_ena = 1;
+            i_csr_addr = 'h40;
+            i_rs1_data = 'hDEADBEEF;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_op = CSRRW;
+            #20;
+            i_csr_addr = 'h41;
+            i_rs1_data = 'hFACEFEED;
+            #20;
+            i_csr_addr = 'h42;
+            i_rs1_data = 'hBAD55555;
+            #20;
+            // prio 3, not pending, yes enabled
+            i_csr_ena = 1;
+            i_csr_addr = 'h20;
+            i_rs1_data = 'h0000000E;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_op = CSRRW;
+            assert(o_interrupt == 0);
+            // honestly these should not be asserted, since it's just an implementation quirk
+            // and has no real effect
+            assert(o_depth == 0);
+            #20;
+            // prio 2, not pending, not enabled
+            i_csr_addr = 'h21;
+            i_rs1_data = 'h00000008;
+            assert(o_interrupt == 0);
+            assert(o_depth == 0);
+            #20;
+            // prio 1, pending and enabled;
+            i_csr_addr = 'h22;
+            i_rs1_data = 'h00000007;
+            i_pc = 'h11111111;
+            #1;
+            assert(o_interrupt == 1);
+            assert(o_nclic_address == 'hBAD55555);
+            assert(o_depth == 0);
+            #19;
+            assert(o_depth == 1);
+            i_csr_addr = 'h20;
+            i_rs1_data = 'h0;
+            i_csr_ena = 0;
+            #1;
+            assert(o_interrupt == 0);
+            #19;
+            assert(o_depth == 1);
+            i_interrupts = 'b00000001; // external interrupt line 0
+            i_pc = 'h22222222;
+            #1;
+            assert(o_depth == 1);
+            assert(o_interrupt == 1);
+            assert(o_nclic_address == 'hDEADBEEF);
+            #19;
+            i_interrupts = 'b00000000;
+            #1;
+            assert(o_interrupt == 0);
+            assert(o_depth == 2);
+            #19;
+            i_interrupts = 'b00000010;
+            #1;
+            assert(o_interrupt == 0);
+            assert(o_depth == 2);
+            #19;
+            i_csr_addr = 'h21;
+            i_rs1_data = 'h00000002;
+            i_csr_ena = 1;
+            i_csr_op = CSRRS;
+            i_interrupts = 'b00000000;
+            #1;
+            assert(o_interrupt == 0);
+            assert(o_depth == 2);
+            #19;
+            i_csr_ena = 0;
+            #1;
+            assert(o_interrupt == 0);
+            assert(o_depth == 2);
+            #19;
+            i_ret = 1;
+            #1;
+            assert(o_interrupt == 1);
+            assert(o_depth == 2);
+            assert(o_nclic_address == 'hFACEFEED);
+            #19;
+            assert(o_depth == 2);
+            assert(o_interrupt == 0);
+            i_ret = 0;
+            #1;
+            assert(o_depth == 2);
+            assert(o_interrupt == 0);
+            #19;
+            #20;
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'h22222222);
+            assert(o_depth == 2);
+            #19;
+            i_ret = 0;
+            assert(o_depth == 1);
+            #20;
+            i_ret = 1;
+            assert(o_depth == 1);
+            #1;
+            assert(o_nclic_address == 'h11111111);
+            #19;
+            // TODO: Do something about returning from depth 0, should probably yield exception.
+            i_ret = 0;
+            assert(o_depth == 0);
+            #20;
+            // Reset state fully
+            i_csr_addr = 'h20;
+            i_csr_ena = 1;
+            i_csr_op = CSRRW;
+            i_rs1_data = 'h00000000;
+            #20;
+            i_csr_addr = 'h21;
+            #20;
+            i_csr_addr = 'h22;
+            #20;
+            i_csr_addr = 'h0;
+            i_csr_ena = 0;
+            i_rs1_data = 'h00000000;
+            #20;
+            // int0 = prio 3 pending 0 ena 1
+            i_csr_addr = 'h020;
+            i_csr_ena = 1;
+            i_rs1_data = 'b1101;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_op = CSRRW;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail cycle 1 depth %d, interrupt %d", o_depth, o_interrupt);
+            #19;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail start cycle 2");
+            // let it go for a bit
+            i_csr_ena = 0;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail end cycle 2");
+            #19;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail start cycle 3");
+            // int1 = prio 1 pending 1 ena 1
+            i_csr_addr = 'h021;
+            i_csr_ena = 1;
+            i_rs1_data = 'b0111;
+            i_pc = 'h11111111;
+            #1;
+            assert(o_interrupt == 1 && o_depth == 0) else $error("fail end cycle 3: simple dispatch depth %d, interrupt %d", o_depth, o_interrupt);
+            assert(o_nclic_address == 'hFACEFEED) else $error("fail end cycle 3: incorrect isr address");
+            #19
+            assert(o_interrupt == 0 && o_depth == 1) else $error("fail start cycle 4: post simple dispatch depth %d, interrupt %d", o_depth, o_interrupt);
+            // int2 = prio 3 pending 1 ena 1
+            i_csr_addr = 'h022;
+            i_rs1_data = 'b1111;
+            i_pc = 'h22222222;
+            #1;
+            assert(o_interrupt == 1 && o_depth == 1) else $error("fail end cycle 4: preemption");
+            assert(o_nclic_address == 'hBAD55555) else $error("fail end cycle 4: incorrect ISR address");
+            #19;
+            i_pc = 'h00000000;
+            assert(o_interrupt == 0 && o_depth == 2) else $error("fail start cycle 5: post preemption");
+            i_csr_ena = 0;
+            #20;
+            assert(o_interrupt == 0 && o_depth == 2) else $error("fail start cycle 6: running under preemption");
+            i_csr_addr = 'h020;
+            i_csr_ena = 1;
+            i_rs1_data = 'b0010;
+            i_csr_op = CSRRS;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 2) else $error("fail end cycle 6: blocking same prio");
+            #19;
+            assert(o_interrupt == 0 && o_depth == 2) else $error("fail start cycle 7: blocking same prio");
+            i_csr_ena = 0;
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'hDEADBEEF) else $error("fail end cycle 7: incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 2) else $error("fail end cycle 7: tail-chaining");
+            #19;
+            assert(o_interrupt == 0 && o_depth == 2) else $error("fail start cycle 8: tail-chaining");
+            assert(o_nclic_address == 'h22222222) else $error("fail cycle 8: incorrect return address");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 1) else $error("fail cycle 9: return");
+            assert(o_nclic_address == 'h11111111) else $error("fail cycle 9: incorrect return address");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail cycle 10: return");
+            i_ret = 0;
+            // external interrupt 1, raise at prio 1
+            i_interrupts = 'b00000010;
+            i_pc = 'h44444444;
+            #1;
+            assert(o_interrupt == 1 && o_depth == 0) else $error("fail cycle 11: external interrupt 1");
+            #19;
+            i_pc = 'h00000000;
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail start cycle 12: post extint1");
+            #1;
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail end cycle 12: redispatched self efter held high");
+            #19;
+            i_interrupts = 0;
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'hFACEFEED); else $error("fail cycle 13: incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 1); else $error("fail cycle 13: did not redispatch self after pended during run");
+            #19;
+            assert(o_nclic_address == 'h44444444); else $error("fail cycle 14: incorrect return address");
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail start cycle 14: self tail-chaining");
+            #20;
+            i_ret = 0;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail start cycle 15: did not return from extint1 properly");
+            // int0 = prio 3 ena 1 pending 0
+            i_csr_addr = 'h20;
+            i_csr_ena = 1;
+            i_rs1_data = 'b1110;
+            i_csr_op = CSRRW;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail end cycle 15");
+            #19;
+            // int1 = prio 2 ena 1 pending 0
+            i_csr_addr = 'h21;
+            i_rs1_data = 'b1010;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail end cycle 16");
+            #19;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail start cycle 17");
+            // int2 = prio 1 ena 1 pending 0
+            i_csr_addr = 'h22;
+            i_rs1_data = 'b0110;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail end cycle 17");
+            #19;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail start cycle 18");
+            // pend all interrupts via external
+            i_pc = 'h55555555;
+            i_interrupts = 'b00000111; 
+            i_csr_ena = 0;
+            #1;
+            assert(o_nclic_address == 'hDEADBEEF); else $error("fail cycle 18 incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 0); else $error("fail end cycle 18 dispatch first ext depth %d interrupt %d", o_depth, o_interrupt);
+            #19;
+            i_pc = 'h00000000;
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail start cycle 19 dispatch first ext");
+            i_interrupts = 'b00000000;
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'hFACEFEED); else $error("fail cycle 19 incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 1); else $error("fail end cycle 19 dispatch second ext");
+            #19;
+            i_ret = 0;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail start cycle 20");
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'hBAD55555); else $error("fail cycle 20 incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 1); else $error("fail end cycle 20");
+            #18;
+            i_ret = 0;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail start cycle 21");
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'h55555555); else $error("fail cycle 21 incorrect return address");
+            assert(o_interrupt == 0 && o_depth == 1); else $error("fail end cycle 21 depth %d interrupt %d", o_depth, o_interrupt);
+            #18;
+            i_ret = 0;
+            assert(o_interrupt == 0 && o_depth == 0); else $error("fail cycle 22, didn't stay at level 0");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail cycle 23, didn't stay at level 0");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail cycle 24, didn't stay at level 0");
+            #20;
+            // pend low prio interrupt
+            i_interrupts = 'b00000100;
+            i_pc = 'hAAAAAAAA;
+            #1;
+            assert(o_nclic_address == 'hBAD55555); else $error("fail cycle 25, incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 0) else $error("fail end cycle 25, didn't dispatch low prio int");
+            #19;
+            i_interrupts = 'b00000010;
+            i_pc = 'hBBBBBBBB;
+            #1;
+            assert(o_nclic_address == 'hFACEFEED); else $error("fail cycle 26 incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 1) else $error("fail end cycle 26, didn't dispatch mid prio int depth %d interrupt %d", o_depth, o_interrupt);
+            #19;
+            i_interrupts = 'b00000001;
+            i_pc = 'hCCCCCCCC;
+            #1;
+            assert(o_nclic_address == 'hDEADBEEF); else $error("fail cycle 27 incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 2) else $error("fail end cycle 27, didn't dispatch high prio int");
+            #19;
+            i_pc = 'h0000000;
+            i_interrupts = 'b00000000;
+            assert(o_interrupt == 0 && o_depth == 3) else $error("fail end cycle 28, high prio dispatch");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 3) else $error("fail cycle 29, did not stay high prio");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 3) else $error("fail cycle 30, did not stay high prio");
+            #20;
+            i_interrupts = 'b00000100;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 3) else $error("fail cycle 31, did not ignore low prio int");
+            #19;
+            i_interrupts = 'b00000000;
+            assert(o_interrupt == 0 && o_depth == 3) else $error("fail start cycle 32, did not ignore low prio int");
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'hCCCCCCCC) else $error("fail cycle 32, incorrect return address");
+            assert(o_interrupt == 0 && o_depth == 3) else $error("fail end cycle 32, did not return to prio 2");
+            #19;
+            assert(o_nclic_address == 'hBBBBBBBB) else $error("fail cycle 33, incorrect return address");
+            assert(o_interrupt == 0 && o_depth == 2) else $error("fail cycle 33, did not return to prio 2");
+            #20;
+            i_ret = 0;
+            #1;
+            assert(o_interrupt == 0 && o_depth == 1) else $error("fail cycle 34, did not return to prio 1 depth %d interrupt %d", o_depth, o_interrupt);
+            i_ret = 1;
+            #1;
+            assert(o_nclic_address == 'hBAD55555) else $error("fail cycle 34, incorrect ISR address");
+            assert(o_interrupt == 1 && o_depth == 1) else $error("fail end cycle 34, did not tail chain self");
+            #18;
+            assert(o_nclic_address == 'hAAAAAAAA) else $error("fail cycle 35, incorrect return address");
+            assert(o_interrupt == 0 && o_depth == 1) else $error("fail cycle 35, did not tail chain self");
+            #20;
+            assert(o_interrupt == 0 && o_depth == 0) else $error("fail cycle 36, did not return to prio 0");
+            i_ret = 0;
+            #20;
+            $finish;
+        end
+    endmodule
+}}}

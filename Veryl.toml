@@ -1,0 +1,11 @@
+[project]
+name = "veryl_nclic"
+version = "0.1.0"
+
+[dependencies]
+veryl_csr = { version = "0.2.0", git = "https://github.com/onsdagens/veryl_csr.git" }
+
+[build]
+exclude_std = true
+source = "src"
+target = { type = "directory", path = "target" }
