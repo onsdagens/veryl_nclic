@@ -1,5 +1,5 @@
 import veryl_csr::CsrPkg::*;
-import ArbitrationPackage::*;
+//import ArbitrationPackage::*;
 module NClic #(
     param BaseAddr: CsrAddr = 'h20 as CsrAddr,
 ) (
@@ -23,6 +23,23 @@ module NClic #(
     o_depth        : output logic<2> , // for now prio 0-3, we can make this parametric
 
     i_pc: input logic<32>,
+
+
+    // Formal verification interface
+    f_pending_bits: output logic<8>    ,
+    f_enabled_bits: output logic<8>    ,
+    f_priorities  : output logic<2> [8],
+    f_interrupt   : output logic       ,
+
+    f_isr_addresses: output logic<32> [8],
+    
+    f_dispatched_index: output logic<3>,
+    f_nclic_address: output logic<32>,
+
+    f_threshold: output logic<2>,
+    f_ret: output logic,
+
+    f_external_lines: output logic<8>
 ) {
 
     var dispatches: logic<8>     ;
@@ -30,7 +47,7 @@ module NClic #(
     var prios     : logic<2>  [8];
     var enableds  : logic<8>     ;
     var o_datas   : logic<32> [8];
-    for i in 0..7 :gen_wrapper {
+    for i in 0..8 :gen_wrapper {
         inst csr: CfgCsrWrapper #(
             Addr: (i as CsrAddr) + BaseAddr,
         ) (
@@ -57,7 +74,7 @@ module NClic #(
     var address_w_datas: logic<32> [8];
     var address_r_enas : logic     [8];
     var address_r_datas: logic<32> [8];
-    for i in 0..7 :gen_isr_addr {
+    for i in 0..8 :gen_isr_addr {
         inst csr: veryl_csr::Csr #(
             Addr       : (i as CsrAddr) + BaseAddr + 'h20 as CsrAddr,
             FieldOffset: 0                                          ,
@@ -87,13 +104,15 @@ module NClic #(
     }
 
     var arbitration_vals: logic<2> [8];
-    for i in 0..7 :gen_arbitration_vals {
+    for i in 0..8 :gen_arbitration_vals {
         assign arbitration_vals[i] = if (pendings[i] && enableds[i]) ? prios[i] : 0 as 2;
     }
 
     var arbitered_index: logic<3>;
     var arbitered_prio : logic<2>;
-    inst arbitration: ArbitrationTree::<ArbitrationPackage::ArbitrationPolarity::MAX> (
+    inst arbitration: ArbitrationTree #(
+        Polarity: true,
+    ) (
         values_i: arbitration_vals,
         index_o : arbitered_index ,
         prio_o  : arbitered_prio  ,
@@ -134,10 +153,97 @@ module NClic #(
     :
         isr_addresses[arbitered_index] as 32
     ;
-    for i in 0..7 :gen_dispatches {
+    for i in 0..8 :gen_dispatches {
         assign dispatches[i] = if i == arbitered_index && o_interrupt ? 1 : 0;
     }
 
+    // Formal properties
+    assign f_pending_bits  = pendings;
+    assign f_enabled_bits  = enableds;
+    assign f_priorities    = prios;
+    assign f_isr_addresses = isr_addresses;
+    assign f_interrupt     = o_interrupt;
+    assign f_dispatched_index = arbitered_index;
+    assign f_nclic_address = o_nclic_address;
+    assign f_threshold = prio_threshold;
+    assign f_ret = i_ret;
+
+    assign f_external_lines = i_interrupts;
+
+    embed (inline) sv{{{
+        `ifdef FORMAL
+        logic f_past_valid;
+        initial begin
+            ni_rst = 0;
+            f_past_valid = 0;
+        end
+        always_ff @(posedge i_clk) begin
+            f_past_valid = 1;
+        end
+        always_comb begin
+            // (non-tail chain case)
+            // if an interrupt is dispatched
+            if (f_interrupt && !f_ret) begin
+                //the dispatched interrupt is enabled and pending
+                assert(f_pending_bits[f_dispatched_index] == 1);
+                assert(f_enabled_bits[f_dispatched_index] == 1);
+                //the priority of the dispatched interrupt is (of the) largest among all pending
+                //and enabled interrupt vectors
+                foreach (f_pending_bits[i]) begin
+                    if (f_pending_bits[i] && f_enabled_bits[i]) begin
+                        assert(f_priorities[i] <= f_priorities[f_dispatched_index]);
+                    end
+                end
+                // the priority is also larger than the current priority threshold
+                assert(f_priorities[f_dispatched_index] > f_threshold);
+                //the target address is of the corresponding isr
+                assert(f_nclic_address == f_isr_addresses[f_dispatched_index]);
+            end
+            // conversely, for all interrupt vectors
+            foreach (f_pending_bits[i]) begin
+                // if an interrupt is pending and enabled, and the priority exceeds current threshold
+                if (f_pending_bits[i] && f_enabled_bits[i] && f_threshold < f_priorities[i] && !f_ret) begin
+                    // an interrupt will always be dispatched
+                    assert(f_interrupt);
+                end
+            end
+        end
+        // i am unhappy about this building on the CSR interface,
+        // but unsure how to express this otherwise (more generically).
+        // imo optimally, the formal model is agnostic to the interface used to
+        // configure the interrupt controller (say if it's MMIO instead of CSRs)
+        always_ff @(posedge i_clk) begin
+            // if we dispatched an interrupt last cycle
+            if ($past(f_interrupt) && f_past_valid) begin
+                // and this interrupt is not still being raised externally
+                if(f_external_lines[$past(f_dispatched_index)] == 0) begin
+                // and the config CSR is not being written externally
+                    if (!i_csr_ena || (i_csr_addr != (BaseAddr + $past(f_dispatched_index)))) begin
+                        // the pending bit of the dispatched interrupt will be brought low
+                        assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+                    end
+                    // if the CSR is being written
+                    else begin
+                        // if the operation is a 32-bit write or set (clear will never bring a bit high)
+                        if (i_csr_op == CSRRW || i_csr_op == CSRRS) begin
+                            // but the pending bit of the operand is 0
+                            if (!i_rs1_data[0]) begin
+                                // the pending bit of the dispatched interrupt is low
+                                assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+                            end 
+                        // similarly for the immediate variants
+                        end else if (i_csr_op == CSRRWI || i_csr_op == CSRRSI) begin
+                            if (!i_rs1[0]) begin
+                                assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+                            end
+                        end
+                    end
+                end
+
+            end
+        end
+        `endif
+    }}}
 }
 
 #[test(nclic)]
@@ -164,7 +270,16 @@ embed (inline) sv{{{
 
         logic[31:0] i_pc;
 
-
+        logic[7:0] f_pending_bits;
+        logic[7:0] f_enabled_bits;
+        logic[1:0] f_priorities [8];
+        logic f_interrupt;
+        logic[31:0] f_isr_addresses[8];
+        logic[2:0] f_dispatched_index;
+        logic[31:0] f_nclic_address;
+        logic[2:0] f_threshold;
+        logic f_ret;
+        logic[7:0] f_external_lines;
         veryl_nclic_NClic dut (
             .i_clk,
             .ni_rst,
@@ -183,7 +298,21 @@ embed (inline) sv{{{
             .o_nclic_address,
             .o_depth,
 
-            .i_pc
+            .i_pc,
+
+            .f_pending_bits,
+            .f_enabled_bits,
+            .f_priorities,
+            .f_interrupt,
+            .f_isr_addresses,
+
+            .f_dispatched_index,
+            .f_nclic_address,
+
+            .f_threshold,
+            .f_ret,
+
+            .f_external_lines
         );
         initial begin
             ni_rst = 0;

@@ -1,0 +1,12 @@
+[options]
+mode bmc
+
+[engines]
+smtbmc boolector
+
+[script]
+read -formal arbitration.sv
+prep -top veryl_nclic_ArbitrationTree
+
+[files]
+target/arbitration.sv

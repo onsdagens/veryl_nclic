@@ -1,0 +1,16 @@
+[options]
+mode bmc
+
+[engines]
+smtbmc boolector
+
+[script]
+read -formal arbitration.sv csr_pkg.sv csr.sv cfg_csr_wrapper.sv n_clic.sv
+prep -top veryl_nclic_NClic
+
+[files]
+target/n_clic.sv
+target/cfg_csr_wrapper.sv
+dependencies/veryl_csr/src/csr_pkg.sv
+dependencies/veryl_csr/src/csr.sv
+target/arbitration.sv

@@ -3,3 +3,5 @@ dependencies/
 target/
 *.f
 src/*.vcd
+nclic/
+arbitration/
