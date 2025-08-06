@@ -5,3 +5,4 @@ target/
 src/*.vcd
 nclic/
 arbitration/
+Makefile

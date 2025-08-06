@@ -15,7 +15,7 @@ build: clean
 verify: verify_arb
 
 verify_arb: build
-	YOSYSHQ_LICENSE=$LICENSE_PATH sby arbitration.sby
+	YOSYSHQ_LICENSE=$(LICENSE_PATH) sby arbitration.sby
 
 verify_nclic: build
-	YOSYSHQ_LICENSE=$LICENSE_PATH sby nclic.sby
+	YOSYSHQ_LICENSE=$(LICENSE_PATH) sby nclic.sby
