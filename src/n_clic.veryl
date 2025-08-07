@@ -21,6 +21,7 @@ module NClic #(
     o_interrupt    : output logic    ,
     o_nclic_address: output logic<32>,
     o_depth        : output logic<2> , // for now prio 0-3, we can make this parametric
+    o_ret_ex: output logic,
 
     i_pc: input logic<32>,
 
@@ -45,6 +46,7 @@ module NClic #(
 
     f_threshold_peek: output logic<2>,
     f_ret_address_peek: output logic<32>,
+    f_ret_ex: output logic,
 ) {
 
     var dispatches: logic<8>     ;
@@ -151,7 +153,9 @@ module NClic #(
         }
     }
 
-    assign o_interrupt = if i_ret ? threshold_stack[o_depth - 1] <: arbitered_prio : prio_threshold <: arbitered_prio;
+    let current_threshold: logic<2> = if i_ret ? threshold_stack[o_depth - 1] : prio_threshold;
+    assign o_interrupt = current_threshold <: arbitered_prio;
+    assign o_ret_ex = if i_ret && (o_depth == 0) ? 1 : 0;
     // TODO
     assign o_nclic_address = if i_ret ?
         (if o_interrupt ? isr_addresses[arbitered_index] : ret_address_stack[o_depth - 1])
@@ -170,12 +174,16 @@ module NClic #(
     assign f_interrupt     = o_interrupt;
     assign f_dispatched_index = arbitered_index;
     assign f_nclic_address = o_nclic_address;
-    assign f_threshold = prio_threshold;
+    // the threshold we are using is essentially if i_ret stack[depth - 1] else thresh_reg, why not use that.
+    assign f_threshold = current_threshold;
+    //assign f_threshold = prio_threshold;
     assign f_ret = i_ret;
     assign f_depth = o_depth;
     assign f_external_lines = i_interrupts;
     assign f_threshold_peek = threshold_stack[o_depth - 1];
     assign f_ret_address_peek = ret_address_stack[o_depth - 1]; 
+
+    assign f_ret_ex = o_ret_ex;
 
     embed (inline) sv{{{
         `ifdef FORMAL
@@ -205,32 +213,19 @@ module NClic #(
                 // the target address is of the corresponding isr
                 assert(f_nclic_address == f_isr_addresses[f_dispatched_index]);
 
-                // if no tailchaining
-                if (!f_ret) begin
-                    // the priority is also larger than the current priority threshold
-                    assert(f_priorities[f_dispatched_index] > f_threshold);
-                end else begin // if tailchaining
-                    // TODO: we need to handle depth zero ret case with an exception, this
-                    // is also an implementation question
-                    if (o_depth != 0) begin
-                        assert(f_priorities[f_dispatched_index] > f_threshold_peek);
-                    end
-                end
+                // and the priority is larger than the threshold
+                // reason this works is SV does not wrap indices, 
+                // so what happens here on returning from depth 0 is f_threshold == threshold_stack[-1] == 0
+                // in reality, returning from depth == 0 causes an exception, so there is no issue
+                assert(f_priorities[f_dispatched_index] > f_threshold);
             end
-            // conversely, if there is no interrupt begin raised
+            // conversely, if there is no interrupt being raised
             if (!f_interrupt) begin
                 // for all of the interrupt vectors
                 foreach(f_pending_bits[i]) begin
-                    // tail chaining case
-                    if (i_ret) begin
-                        // either the pending bit or the enabled bit is off
-                        // or the priority does not exceed the current threshold
-                        assert(f_pending_bits[i] == 0 || f_enabled_bits[i] == 0 || f_threshold_peek >= f_priorities[i]);
-                    end
-                    // non-tailchaining case
-                    else begin
-                        assert(f_pending_bits[i] == 0 || f_enabled_bits[i] == 0 || f_threshold >= f_priorities[i]);
-                    end
+                    // either the pending bit or the enabled bit is 0 or
+                    // the priority is equal to or larger than the threshold
+                    assert(f_pending_bits[i] == 0 || f_enabled_bits[i] == 0 || f_threshold >= f_priorities[i]);
                 end
                 // if we are returning from an interrupt
                 // this should really also have a piece in the clocked part of the model,
@@ -240,45 +235,108 @@ module NClic #(
                     assert(f_nclic_address == f_ret_address_peek);
                 end
             end
+            // generally if we are returning at depth == 0
+            if (f_ret) begin
+                if (f_depth == 0) begin
+                    // an exception is raised
+                    assert(f_ret_ex);
+                end
+            end
         end
         // i am unhappy about this building on the CSR interface,
         // but unsure how to express this otherwise (more generically).
         // imo optimally, the formal model is agnostic to the interface used to
         // configure the interrupt controller (say if it's MMIO instead of CSRs)
         always_ff @(posedge i_clk) begin
-            // if we dispatched an interrupt last cycle
-            if ($past(f_interrupt) && f_past_valid) begin
-                // and this interrupt is not still being raised externally
-                if(f_external_lines[$past(f_dispatched_index)] == 0) begin
-                // and the config CSR is not being written externally
-                    if (!i_csr_ena || (i_csr_addr != (BaseAddr + $past(f_dispatched_index)))) begin
-                        // the pending bit of the dispatched interrupt will be brought low
-                        assert(f_pending_bits[$past(f_dispatched_index)] == 0);
-                    end
-                    // if the CSR is being written
-                    else begin
-                        // if the operation is a 32-bit write or set (clear will never bring a bit high)
-                        if (i_csr_op == CSRRW || i_csr_op == CSRRS) begin
-                            // but the pending bit of the operand is 0
-                            if (!i_rs1_data[0]) begin
-                                // the pending bit of the dispatched interrupt is low
-                                assert(f_pending_bits[$past(f_dispatched_index)] == 0);
-                            end 
-                        // similarly for the immediate variants
-                        end else if (i_csr_op == CSRRWI || i_csr_op == CSRRSI) begin
-                            if (!i_rs1[0]) begin
-                                assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+            // this has to do with the validity of the previous cycle
+            // (and whether it wasn't under reset, which should be handled elsewhere).
+            if (f_past_valid && $past(ni_rst) && ni_rst) begin
+                // if we dispatched an interrupt last cycle
+                if ($past(f_interrupt)) begin
+                    // and this interrupt is not still being raised externally
+                    if(f_external_lines[$past(f_dispatched_index)] == 0) begin
+                    // and the config CSR is not being written externally
+                        if (!i_csr_ena || (i_csr_addr != (BaseAddr + $past(f_dispatched_index)))) begin
+                            // the pending bit of the dispatched interrupt will be brought low
+                            assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+                        end
+                        // if the CSR is being written
+                        else begin
+                            // if the operation is a 32-bit write or set (clear will never bring a bit high)
+                            if (i_csr_op == CSRRW || i_csr_op == CSRRS) begin
+                                // but the pending bit of the operand is 0
+                                if (!i_rs1_data[0]) begin
+                                    // the pending bit of the dispatched interrupt is low
+                                    assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+                                end 
+                            // similarly for the immediate variants
+                            end else if (i_csr_op == CSRRWI || i_csr_op == CSRRSI) begin
+                                if (!i_rs1[0]) begin
+                                    assert(f_pending_bits[$past(f_dispatched_index)] == 0);
+                                end
                             end
                         end
                     end
-                end
-                // TODO: this is broken somehow still
-                // additionally, the top of the stack now has the previous threshold (if not tail chaining)
-                if (!f_ret) begin
-                    //assert(f_depth == $past(f_depth) + 1);
-                    //assert(f_threshold_peek == $past(f_threshold));
-                end
+                    // if we didn't tail chain
+                    if (!$past(f_ret)) begin
+                        // and the interrupt wasn't dispatched at max depth
+                        // (which is supposed to be impossible, but remains to be formalized)
+                        // the depth increases
+                        if ($past(f_depth) < 3) begin
+                            assert(f_depth == ($past(f_depth) + 1));
+                            // the threshold has been stacked
+                            assert(f_threshold_peek == $past(f_threshold));
+                            // and so has the source pc
+                            // TODO: i_pc should be f_pc
+                            assert(f_ret_address_peek == $past(i_pc));
+                        end
 
+                    end
+                    // if we did tail chain
+                    else begin
+                        // the depth remains the same
+                        assert(f_depth == $past(f_depth));
+                        // if depth is 0, the peek value is invalid, otherwise
+                        if (f_depth > 0) begin
+                            // ensure the peek value does not change
+                            assert(f_threshold_peek == $past(f_threshold_peek));
+                            assert(f_ret_address_peek == $past(f_ret_address_peek));
+                        end
+                    end
+                end
+                // if we didn't dispatch an interrupt last cycle
+                else begin
+                    // and we returned from an interrupt
+                    if ($past(f_ret)) begin
+                        // and we aren't returning at depth 0
+                        if ($past(f_depth) > 0) begin
+                        // then the depth has been decreased
+                            assert(f_depth == $past(f_depth) - 1);     
+                        end
+                    end
+                    // if we did not dispatch or return
+                    else begin
+                        // depth remains the same
+                        assert($past(f_depth) == f_depth);
+                        // if depth is 0, no value on the stack is valid
+                        if (f_depth > 0) begin
+                            // make sure the top of the stack does not change
+                            // really we need to make sure this somehow applies to all values
+                            // but idk how yet
+                            assert(f_threshold_peek == $past(f_threshold_peek));
+                            assert(f_ret_address_peek == $past(f_ret_address_peek));
+                        end
+                        // additionally, unless we are returning now
+                        if (!f_ret) begin
+                            // the threshold remains the same
+                            assert($past(f_threshold) == f_threshold);
+                        end
+                        else begin
+                            // otherwise, the threshold is the top of the stack
+                            assert(f_threshold_peek == f_threshold);
+                        end
+                    end
+                end
             end
         end
         `endif
