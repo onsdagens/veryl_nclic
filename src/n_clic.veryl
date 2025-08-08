@@ -48,6 +48,8 @@ module NClic #(
     f_ret_address_peek: output logic<32>,
     f_ret_ex: output logic,
 ) {
+    // TODO!
+    assign o_csr_data = 0;
 
     var dispatches: logic<8>     ;
     var pendings  : logic<8>     ;
